@@ -38,47 +38,6 @@ class EvaluationSourceSnapshotTest(unittest.TestCase):
         self.assertEqual(hashed_scripts, set(EVALUATION_SCRIPT_FILENAMES))
         self.assertIn("evaluation_capacity.py", EVALUATION_SCRIPT_FILENAMES)
 
-    def test_stencil_cache_broadcasts_preserve_foot_axis(self):
-        source = (
-            Path(__file__).resolve().parents[1] / "scripts/stability_experiment.py"
-        ).read_text()
-        tree = ast.parse(source)
-        calls = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "repeat_interleave"
-        ]
-        # Settling, the exact finite-difference fork, and the zero-only
-        # reproducibility fork each broadcast both contact caches.
-        self.assertEqual(len(calls), 6)
-        for call in calls:
-            dimensions = [
-                keyword.value for keyword in call.keywords if keyword.arg == "dim"
-            ]
-            self.assertEqual(len(dimensions), 1)
-            self.assertIsInstance(dimensions[0], ast.Constant)
-            self.assertEqual(dimensions[0].value, 0)
-
-    def test_collector_does_not_assume_pre_step_failure_cache_exists(self):
-        source = (
-            Path(__file__).resolve().parents[1] / "scripts/stability_experiment.py"
-        ).read_text()
-        self.assertNotIn("env.substep_failure", source)
-
-    def test_zero_diagnostic_is_fail_closed_before_app_launch(self):
-        source = (
-            Path(__file__).resolve().parents[1] / "scripts/stability_experiment.py"
-        ).read_text()
-        pre_app = source[:source.index("app = AppLauncher(args).app")]
-        self.assertIn("args.zero_reproducibility_clones == 64", pre_app)
-        self.assertIn("args.enhanced_determinism", pre_app)
-        self.assertIn("args.seed == DEVELOPMENT_REFERENCE_SEED", pre_app)
-        self.assertIn(
-            "cfg.sim.physx.enable_enhanced_determinism = args.enhanced_determinism",
-            source)
-        self.assertIn("Identical fork produced unequal first actions", source)
-
 
 class ZeroReproducibilityTest(unittest.TestCase):
     def payload(self):

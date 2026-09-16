@@ -33,6 +33,9 @@ parser.add_argument("--capture_joints", action="store_true",
                     help="Also archive per-step policy observations/actions, joint states, "
                          "applied torques and per-foot contact force vectors (sim2sim debugging)")
 parser.add_argument("--camera_env", type=int, default=0)
+parser.add_argument("--video_follow", action="store_true",
+                    help="Chase the recorded robot with a close camera instead of a fixed "
+                         "trackside view. Affects the recording only, never the rollout")
 parser.add_argument("--dfs", type=float, nargs="+")
 parser.add_argument("--gait", choices=GAITS, default="trot")
 parser.add_argument("--period", type=float, default=.48)
@@ -160,6 +163,17 @@ SCIENCE_SOURCE_PATHS = (
     "source/beam_walking/beam_walking/experiment/protocol.py",
     *DEPLOYMENT_SOURCE_PATHS,
 )
+
+
+def aim_recording_camera(env, camera_env, follow, trackside_center):
+    """Point the recording camera. Visual only: it never touches the rollout."""
+    if follow:
+        base = env.scene["robot"].data.root_pos_w[camera_env].cpu().numpy()
+        env.sim.set_camera_view(eye=base + np.array([.9, -1.7, .75]),
+                                target=base + np.array([0., 0., .05]))
+    else:
+        env.sim.set_camera_view(eye=trackside_center + np.array([2.5, -4., 2.4]),
+                                target=trackside_center)
 
 
 def snapshot_source_path(snapshot, relative):
@@ -365,8 +379,7 @@ def evaluate(env, wrapped, policy, provenance):
                     raise ValueError("camera_env must index an evaluated environment")
                 origin = env.scene.env_origins[args.camera_env].cpu().numpy()
                 center = origin + np.array([1.5, 0., .2])
-                env.sim.set_camera_view(
-                    eye=center + np.array([2.5, -4., 2.4]), target=center)
+                aim_recording_camera(env, args.camera_env, args.video_follow, center)
                 import imageio.v2 as imageio
                 temporary_video = args.output / (
                     f"{stem}_seed{args.seed + args.camera_env}_recording.mp4")
@@ -411,6 +424,8 @@ def evaluate(env, wrapped, policy, provenance):
                         traces.setdefault(key, []).append(value.cpu().numpy())
                     if args.video and include_post_step_video_frame(
                             step, active[args.camera_env], done[args.camera_env]):
+                        if args.video_follow:
+                            aim_recording_camera(env, args.camera_env, True, center)
                         video_writer.append_data(env.render())
                     active &= ~done.bool()
                     if not bool(active.any()):

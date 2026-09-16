@@ -9,6 +9,6 @@
   "family_alpha": 0.05,
   "failed_contexts": [],
   "failed_width_groups": [],
-  "selector_checkpoint_sha256": "46fcc031583f44813770acc442278f8244e8d3524943f623125f429210a94f0d",
+  "selector_checkpoint_sha256": "4cb6f6fd2278d1c62819c239672c3043536d2ce008c23355f1c8afce5301e62d",
   "validated_selector": "validated_robust_duty_selector.pt"
 }

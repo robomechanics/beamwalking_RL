@@ -2,7 +2,7 @@
 
 This is the single, current description of how the RL policies for the paper
 are trained and evaluated. It is updated in place when the pipeline changes.
-The runnable version is `scripts/pipelines/specialist_pipeline.sh`.
+The runnable version is `scripts/pipeline.sh`.
 
 ## What it produces
 
@@ -34,12 +34,12 @@ swing ticks. Commands change only at gait-cycle boundaries.
 |---|---|---|---|
 | 1 | Training | `scripts/narrow_specialist_experiment.py train --gait G` | 3,072 envs, 1,800 PPO updates, seed 5, 10% grounded starts |
 | 2 | Command fidelity | `scripts/evaluate_policy.py --task narrow_specialist` | trot 0.36/0.40/0.48/0.54 s, walk 0.40/0.48/0.54 s, all widths and evaluated duty factors, 64 held-out trials, 0.30 m/s |
-| 3 | Duty-contrast check | `scripts/narrow_fidelity_gate.py --criterion contrast` | recorded for every fidelity run |
+| 3 | Duty-contrast check | `scripts/duty_contrast_check.py --criterion contrast` | recorded for every fidelity run |
 | 4 | Robustness | `scripts/evaluate_policy.py --task narrow_specialist --perturbation` | every speed (0.25/0.30/0.35/0.40 m/s) and every period of stage 2, all widths and evaluated duty factors, 64 held-out trials under random base disturbances up to 25 N |
 | 4b | Robustness, stronger disturbance | same, `--perturbation_max_force 50 --perturbation_max_torque 6` | for a gait whose 0.20–0.30 m cells all reach 95% success at 25 N and 0.30 m/s, its 0.30 m/s runs repeated with disturbances up to 50 N |
 | 5 | Period sweep | `scripts/collect_policy_surfaces.py --task narrow_specialist --period-sweep` | trot 0.36/0.40/0.48/0.54 s, walk 0.40/0.48/0.54 s, 4 speeds, 6 widths, feasible evaluated duty factors, 32 matched trials |
-| 6 | Selector network | `scripts/fit_robust_duty_selector.py`; `scripts/evaluate_policy.py --perturbation --split test` on the selections; `scripts/validate_robust_duty_selector.py` | labels from stage 4, fit, fresh-seed validation under the same disturbances, promotion |
-| 7 | Figures | `scripts/make_narrow_paper_figures.py` | five paper figures, each with its data table (below) |
+| 6 | Selector network | `scripts/fit_duty_selector.py`; `scripts/evaluate_policy.py --perturbation --split test` on the selections; `scripts/validate_duty_selector.py` | labels from stage 4, fit, fresh-seed validation under the same disturbances, promotion |
+| 7 | Figures | `scripts/make_paper_figures.py` | five paper figures, each with its data table (below) |
 | 8 | Export | shell step | per-trial CSVs, robustness summaries, policy provenance, duty-contrast report, selector fit, validation and promotion, and the paper figures into `paper_data/` |
 
 Trainings run one at a time. Stages 2 and 5 run trot and walk side by side, and
@@ -182,7 +182,8 @@ In every per-trial CSV, one row is one rollout. Columns include the commands
 ## Running
 
 ```
-setsid nohup bash scripts/pipelines/specialist_pipeline.sh > results/pipeline.log 2>&1 &
+mkdir -p results
+setsid nohup bash scripts/pipeline.sh > results/pipeline.log 2>&1 &
 tail -f results/narrow_20260914.status
 ```
 
@@ -204,9 +205,9 @@ recorded at training time, so leave them unchanged while a run is in progress.
 | `source/beam_walking/beam_walking/experiment/narrow_specialist_task.py` | environment config: self-collision, placement tolerance |
 | `scripts/narrow_specialist_surface_data.py` | sweep definitions, evaluated duty factors, checkpoint checks for the collector |
 | `source/beam_walking/beam_walking/experiment/unified_duty_selector.py` | selector classifier, candidate levels, feasibility mask |
-| `scripts/fit_robust_duty_selector.py` | selector labels and intervals from the robustness runs, fit |
-| `scripts/validate_robust_duty_selector.py` | validation run plan, fresh-seed test, promotion |
-| `scripts/make_narrow_paper_figures.py` | the five paper figures and their tables |
+| `scripts/fit_duty_selector.py` | selector labels and intervals from the robustness runs, fit |
+| `scripts/validate_duty_selector.py` | validation run plan, fresh-seed test, promotion |
+| `scripts/make_paper_figures.py` | the five paper figures and their tables |
 
 ## Limitations
 

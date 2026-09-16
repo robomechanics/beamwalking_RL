@@ -29,8 +29,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "source/beam_walking"))
 
-from beam_walking.experiment import unified_duty_selector as selector  # noqa: E402
-from beam_walking.experiment.duty_selector import selector_state_sha256  # noqa: E402
+from beam_walking.experiment import unified_duty_selector as selector
+from beam_walking.experiment.duty_selector import selector_state_sha256
 
 SCHEMA = "robust_duty_selector_v1"
 FAMILY_ALPHA = .05

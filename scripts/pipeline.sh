@@ -1,20 +1,9 @@
 #!/bin/bash
-# Narrow-stance pipeline, stance width 0.05-0.30 m, self-collision on, no domain
-# randomization. One trot and one walk specialist are the reported controllers.
-#   1  train the trot and walk specialists
-#   2  command fidelity at every period
-#   3  duty-contrast check over all fidelity runs (recorded, never stops the run)
-#   4  robustness: success under disturbances at every speed, period, width and duty
-#   5  period sweeps, both gaits
-#   6  duty-factor selector network from success under disturbance, fresh-seed
-#      validation, promotion
-#   7  paper figures
-#   8  export CSVs and the paper figures into paper_data/specialist_<tag>
-# Documented in PIPELINE.md at the repo root. Resumable: completed stages are
-# skipped. Run from anywhere:
-#   setsid nohup bash scripts/pipelines/specialist_pipeline.sh > results/pipeline.log 2>&1 &
-# Set REPO_ROOT when running a copy of this script from another directory.
-cd "${REPO_ROOT:-$(dirname "$0")/../..}" || exit 1
+# Narrow-stance specialist pipeline. Stages and settings: PIPELINE.md.
+#   mkdir -p results && setsid nohup bash scripts/pipeline.sh > results/pipeline.log 2>&1 &
+# TAG, PYTHON_BIN, WORKERS and REPO_ROOT override the defaults below.
+cd "${REPO_ROOT:-$(dirname "$0")/..}" || exit 1
+mkdir -p results
 PYTHON_BIN=${PYTHON_BIN:-$HOME/anaconda3/envs/isaaclab/bin/python}
 P="env -u PYTHONPATH -u AMENT_PREFIX_PATH $PYTHON_BIN"
 TAG=${TAG:-narrow_20260914}
@@ -33,15 +22,10 @@ ck() { echo results/narrow_specialist_$1_seed5_3072_${TAG}/model_1799.pt; }
 periods_of() { [ "$1" = walk ] && echo ".40 .48 .54" || echo ".36 .40 .48 .54"; }
 SPEEDS=".25 .30 .35 .40"
 v3() { awk -v s="$1" 'BEGIN { printf "%03d", s * 100 + .5 }'; }   # .30 -> 030
-# Evaluated duty factors: trot every 0.05 from 0.50 (0.75 needs a period of at
-# least 0.40 s for five swing ticks), walk 0.75-0.90.
 dfs_of() { # gait period
   if [ "$1" = walk ]; then echo ".75 .80 .85 .90"
   elif [ "$2" = .36 ]; then echo ".50 .55 .60 .65 .70"
   else echo ".50 .55 .60 .65 .70 .75"; fi; }
-# Empty a training output directory. A trainer stopped by a signal can leave its
-# watcher alive, and the watcher's final report would land in the emptied
-# directory and make the retry refuse to start. Stop that watcher first.
 fresh() { local d waited
   for d; do
     pkill -f "watch_training.py --run $PWD/$d " 2>/dev/null
@@ -51,7 +35,7 @@ fresh() { local d waited
     rm -rf "$d"
   done; }
 
-# 1. Training.
+# 1. Training
 for g in trot walk; do
   [ -f "$(ck $g)" ] && continue
   fresh results/narrow_specialist_${g}_smoke_${TAG} results/narrow_specialist_${g}_seed5_3072_${TAG}
@@ -62,10 +46,6 @@ for g in trot walk; do
     --output results/narrow_specialist_${g}_seed5_3072_${TAG} || exit 1
 done
 
-# Evaluations below run trot and walk side by side. Each is an independent
-# process with its own seeds, so running two at once changes timing only.
-# Before each start, wait for the host memory the evaluation check needs, and
-# retry a job whose start is refused.
 eval_mem() { local waited=0
   while [ "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)" -lt 9000 ]; do
     sleep 20; waited=$((waited+20)); [ $waited -ge 900 ] && return 0; done; }
@@ -80,9 +60,6 @@ attempt() { # completion-file stage-name command...
   done
   return 1
 }
-# Run job lines from stdin (each a function call) on $WORKERS workers. A worker
-# claims a job by creating its lock directory, so every job runs once. Each start
-# still waits for the memory the evaluation check needs.
 WORKERS=${WORKERS:-3}
 pool() { # name
   local locks=results/.pool_${TAG}_$1 jobs pids=() n
@@ -102,7 +79,7 @@ pool() { # name
   wait "${pids[@]}"
   rm -rf "$locks"; }
 
-# 2. Command fidelity at every period.
+# 2. Command fidelity
 fid() { # gait period
   local g=$1 p=$2
   local out; out=$(printf "results/validation_narrow_%s_v030_p%.2f_%s" "$g" "$p" "$TAG")
@@ -117,16 +94,13 @@ sleep 45
 ( for p in $(periods_of walk); do fid walk $p; done ) & B=$!
 wait $A $B
 
-# 3. Duty-contrast check over all fidelity runs, recorded in
-#    results/<tag>_fidelity_gate.json. The pipeline continues either way.
+# 3. Duty-contrast check
 GATE_RUNS=""
 for d in results/validation_narrow_*_${TAG}; do GATE_RUNS="$GATE_RUNS $(basename $d | sed "s/validation_narrow_//;s/_${TAG}//")=$d"; done
-run fidelity_gate $P scripts/narrow_fidelity_gate.py --criterion contrast --runs $GATE_RUNS \
+run fidelity_gate $P scripts/duty_contrast_check.py --criterion contrast --runs $GATE_RUNS \
   --output results/${TAG}_fidelity_gate.json
 
-# 4. Robustness: success under random base disturbances at every speed, period,
-#    width and duty factor, on the evaluation workers. The selector's labels come
-#    from these runs; figure 3 uses 0.30 m/s.
+# 4. Robustness
 push_dir() { # gait speed period force
   local level=""; [ "$4" != 25 ] && level="_f$4"
   printf "results/push_robustness_narrow_%s_v%s_p%.2f%s_%s" "$1" "$(v3 $2)" "$3" "$level" "$TAG"; }
@@ -140,9 +114,7 @@ robustness_job() { # gait speed period force
 for v in $SPEEDS; do for g in trot walk; do for p in $(periods_of $g); do
   echo "robustness_job $g $v $p 25"; done; done; done | pool robustness
 
-# 4b. Where every duty factor succeeds in at least 95% of trials at 0.20-0.30 m
-#     for every period at 0.30 m/s, repeat that gait's 0.30 m/s robustness with
-#     disturbances up to 50 N (6 N m) so the wider stances are not at full success.
+# 4b. Robustness, 50 N
 at_ceiling() { # gait
   python3 - "$1" $(for p in $(periods_of $1); do echo "$(push_dir $1 .30 $p 25)/perturbation_summary.json"; done) <<'PY'
 import json, sys
@@ -155,7 +127,7 @@ for g in trot walk; do
   at_ceiling $g && for p in $(periods_of $g); do echo "robustness_job $g .30 $p 50"; done
 done | pool robustness_50n
 
-# 5. Period sweeps, trot and walk side by side.
+# 5. Period sweeps
 sweep() { local g=$1
   local out=results/narrow_surfaces_sweep_${g}_${TAG}/grid
   attempt "$out/SURFACE_COMPLETE" "surface_sweep_$g" \
@@ -167,15 +139,12 @@ sleep 45
 sweep walk & B=$!
 wait $A $B
 
-# 6. Duty-factor selector network. Labels come from success under disturbance at
-#    every speed, period and width (stage 4). Every selection is run again under
-#    the same disturbances on the held-out test split, then the selector is
-#    promoted. A new fit discards the previous validation runs.
+# 6. Duty-factor selector network
 FIT=results/narrow_robust_selector_${TAG}
 PROMOTED_DIR=results/narrow_robust_selector_promoted_${TAG}
 if [ ! -f $FIT/robust_duty_selector.pt ]; then
   rm -rf $FIT $PROMOTED_DIR results/narrow_robust_selector_validation_*_${TAG}
-  run selector_fit $P scripts/fit_robust_duty_selector.py --tag $TAG --output $FIT --speeds $SPEEDS --widths $W \
+  run selector_fit $P scripts/fit_duty_selector.py --tag $TAG --output $FIT --speeds $SPEEDS --widths $W \
     --periods trot=$(periods_of trot | tr ' ' ,) walk=$(periods_of walk | tr ' ' ,) \
     --duties trot=$(dfs_of trot .48 | tr ' ' ,) walk=$(dfs_of walk .48 | tr ' ' ,)
 fi
@@ -187,19 +156,18 @@ if [ -f $FIT/robust_duty_selector.pt ]; then
       --gait $1 --speed $2 --period $3 --step_widths ${4//,/ } --dfs ${5//,/ } --perturbation \
       --perturbation_max_force 25 --perturbation_max_torque 3 --split test --seed 1000000 \
       --output "$out" --headless; }
-  $P scripts/validate_robust_duty_selector.py --selector $FIT/robust_duty_selector.pt --tag $TAG --print-jobs \
+  $P scripts/validate_duty_selector.py --selector $FIT/robust_duty_selector.pt --tag $TAG --print-jobs \
     | grep '^selector_validation_job ' | pool selector_validation
   [ -f $PROMOTED_DIR/validated_robust_duty_selector.pt ] || run selector_promote \
-    $P scripts/validate_robust_duty_selector.py --selector $FIT/robust_duty_selector.pt --tag $TAG --output $PROMOTED_DIR
+    $P scripts/validate_duty_selector.py --selector $FIT/robust_duty_selector.pt --tag $TAG --output $PROMOTED_DIR
 fi
 
-# 7. Paper figures: every figure pools the periods at which every duty factor ran.
-#    Nothing is pinned to 0.48 s.
+# 7. Paper figures
 FIG=PAPER_GRAPHS/narrow_specialist/paper_figures
-run figures_paper $P scripts/make_narrow_paper_figures.py --tag $TAG --output $FIG
+run figures_paper $P scripts/make_paper_figures.py --tag $TAG --output $FIG
 echo "figures_done $(date -u +%FT%TZ)" >> $S
 
-# 8. Export.
+# 8. Export
 OUT=paper_data/specialist_${TAG}
 mkdir -p $OUT/trials $OUT/policies $OUT/docs
 for g in trot walk; do
@@ -218,8 +186,6 @@ for d in results/narrow_specialist_*_seed5_3072_${TAG}; do
   cp $d/provenance.json $d/agent.yaml $d/env.yaml $OUT/policies/$n/ 2>/dev/null
   sha256sum $d/model_1799.pt | sed "s|$d/||" > $OUT/policies/$n/model_1799.sha256
 done
-# The selector fit (labels and selections behind figure 5), its fresh-seed
-# validation runs, and the promotion report.
 rm -rf $OUT/selector_fit $OUT/selector_promoted $OUT/trials/selector_validation_*
 [ -f $FIT/robust_duty_selector.pt ] && cp -r $FIT $OUT/selector_fit
 [ -d $PROMOTED_DIR ] && cp -r $PROMOTED_DIR $OUT/selector_promoted

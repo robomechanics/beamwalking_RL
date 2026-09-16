@@ -25,5 +25,5 @@
   "epochs": 3000,
   "final_cross_entropy": 5.594550020759925e-05,
   "exploratory": false,
-  "selector_checkpoint_sha256": "46fcc031583f44813770acc442278f8244e8d3524943f623125f429210a94f0d"
+  "selector_checkpoint_sha256": "4cb6f6fd2278d1c62819c239672c3043536d2ce008c23355f1c8afce5301e62d"
 }

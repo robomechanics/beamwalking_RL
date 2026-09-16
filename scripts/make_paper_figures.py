@@ -1,667 +1,391 @@
-#!/usr/bin/env python3
-"""Build publication figures from the audited flat-ground evaluation outputs.
+"""Paper figures for the narrow-stance specialists.
 
-The script deliberately keeps command-fidelity evidence separate from the
-invalid return-map estimates.  It never plots the suppressed V4/V5 chi values.
+  1  periodicity (cycle RMS, median and interquartile band) against realized
+     duty factor, trot and walk on one axis, one panel per stance width
+  2  positive mechanical CoT against realized duty factor, trot and walk on one
+     axis, one panel per stance width
+  3  robustness: success rate under random base disturbances against stance
+     width, one line per commanded duty factor, trot and walk panels, one row per
+     disturbance level
+  4  realized duty factor by stance width and commanded duty factor, trot and
+     walk panels
+  5  the duty-factor selector network's choice against stance width: mean,
+     interquartile range and full range over its speed and period contexts, trot
+     and walk on one axis
+
+Every figure pools the periods at which every duty factor of the gait was run, so
+each duty factor averages the same periods (trot 0.75 needs 0.40 s or longer).
+CoT uses every trial that completed without a failure and with a finite
+positive value. Each figure is written with the table it plots.
 """
-
-from __future__ import annotations
-
 import argparse
+import csv
 import json
+import math
+import re
+from collections import defaultdict
 from pathlib import Path
+import statistics as st
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
-import pandas as pd
-from matplotlib.lines import Line2D
-from matplotlib.patches import FancyBboxPatch, Patch, Rectangle
-
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TROT = ROOT / "results/validation_v4_seed2_v030_p048_trot_20260911/summary.csv"
-DEFAULT_WALK = ROOT / "results/validation_v4_seed2_v030_p048_walk_20260911/summary.csv"
-DEFAULT_STABILITY = ROOT / "results/stability_v4_seed2_descriptive_20260911"
-DEFAULT_PILOT = ROOT / "results/stability_v5_estimator_pilot_seed1100000_20260911/stability_references.csv"
-DEFAULT_OUTPUT = ROOT / "PAPER_GRAPHS"
-
-COLORS = {
-    "trot_050": "#7A5195",
-    "trot_0625": "#374C80",
-    "trot_075": "#EF5675",
-    "walk_075": "#2A9D8F",
-    "pass": "#2A9D8F",
-    "diagnostic": "#F4A261",
-    "missing": "#B8BEC9",
-    "failed": "#D1495B",
-    "ink": "#243447",
-}
+GAITS = ("trot", "walk")
+GAIT_COLORS = {"trot": "#2a78d6", "walk": "#eb6834"}
+SEQUENTIAL = LinearSegmentedColormap.from_list(
+    "blue", ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"])
+TEXT, MUTED, GRID, AXIS = "#0b0b0b", "#898781", "#e1e0d9", "#c3c2b7"
+DUTY_RAMP = ("#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281", "#0d366b")
+MARKERS = ("o", "s", "^", "D", "v", "P")
 
 
-def configure_plotting() -> None:
-    plt.rcParams.update(
-        {
-            "figure.dpi": 140,
-            "savefig.dpi": 240,
-            "font.size": 10,
-            "axes.titlesize": 11,
-            "axes.labelsize": 10,
-            "legend.fontsize": 8.5,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-            "axes.grid": True,
-            "grid.alpha": 0.22,
-            "grid.linewidth": 0.7,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
+def style(ax, grid=True):
+    ax.tick_params(colors=MUTED, labelsize=8, length=0)
+    if grid:
+        ax.grid(axis="y", color=GRID, lw=.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(AXIS)
 
 
-def save_figure(fig: plt.Figure, output: Path, stem: str) -> None:
-    fig.savefig(output / f"{stem}.png", bbox_inches="tight")
-    fig.savefig(output / f"{stem}.pdf", bbox_inches="tight")
+def save(fig, out, stem, rows):
+    if fig.get_layout_engine() is None:
+        fig.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(out / f"{stem}.{ext}", dpi=200, metadata={"CreationDate": None} if ext == "pdf" else None)
     plt.close(fig)
+    with (out / f"{stem}.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def condition_label(gait: str, duty_factor: float) -> str:
-    if gait == "walk":
-        return "Walk, DF 0.75"
-    return f"Trot, DF {duty_factor:g}"
+def wilson(s, n, z=1.96):
+    p = s / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return max(0., c - h), min(1., c + h)
 
 
-def condition_color(gait: str, duty_factor: float) -> str:
-    if gait == "walk":
-        return COLORS["walk_075"]
-    if np.isclose(duty_factor, 0.5):
-        return COLORS["trot_050"]
-    if np.isclose(duty_factor, 0.625):
-        return COLORS["trot_0625"]
-    return COLORS["trot_075"]
+def balanced_periods(pairs):
+    """Periods at which every condition (width, duty factor, ...) of the gait was run, from
+    (period, condition) pairs, so pooling never mixes periods with different grids."""
+    by_period = defaultdict(set)
+    for period, condition in pairs:
+        by_period[period].add(condition)
+    conditions = set().union(*by_period.values())
+    return sorted(p for p, c in by_period.items() if c == conditions)
 
 
-def load_nominal(trot_path: Path, walk_path: Path) -> pd.DataFrame:
-    frames = []
-    for gait, path in (("trot", trot_path), ("walk", walk_path)):
-        frame = pd.read_csv(path)
-        frame["gait"] = gait
-        frames.append(frame)
-    nominal = pd.concat(frames, ignore_index=True)
-    needed = {
-        "gait",
-        "command_df",
-        "step_width",
-        "body_achieved_width",
-        "achieved_df",
-        "forward_speed",
-        "lateral_rmse",
-        "heading_rmse_rad",
-        "combined_cell_pass",
-        "n",
-    }
-    missing = needed.difference(nominal.columns)
-    if missing:
-        raise ValueError(f"Nominal summaries are missing columns: {sorted(missing)}")
-    return nominal.sort_values(["gait", "command_df", "step_width"]).reset_index(drop=True)
+def runs(results, prefix, suffix):
+    """{period: directory} for directories named exactly <prefix>p<period><suffix>."""
+    pattern = re.compile("^" + re.escape(prefix) + r"p(\d\.\d\d)" + re.escape(suffix) + "$")
+    found = {}
+    for directory in sorted(results.iterdir()):
+        match = pattern.match(directory.name)
+        if match and directory.is_dir():
+            found[float(match.group(1))] = directory
+    return found
 
 
-def make_command_figure(nominal: pd.DataFrame, output: Path) -> dict[str, float | int]:
-    fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.2))
-    groups = list(nominal.groupby(["gait", "command_df"], sort=True))
-
-    ax = axes[0, 0]
-    for (gait, df), group in groups:
-        ax.plot(
-            group["step_width"],
-            group["body_achieved_width"],
-            marker="o",
-            lw=1.8,
-            ms=5,
-            color=condition_color(gait, df),
-            label=condition_label(gait, df),
-        )
-    ax.plot([0.08, 0.52], [0.08, 0.52], ls="--", lw=1.2, color="#5B6573", label="Ideal")
-    ax.set(xlim=(0.08, 0.52), ylim=(0.08, 0.52), xlabel="Commanded full stance width (m)", ylabel="Achieved body-frame width (m)")
-    ax.set_title("a  Stance-width commands are realized", loc="left", fontweight="bold")
-
-    ax = axes[0, 1]
-    offsets = {"trot": -0.006, "walk": 0.006}
-    for (gait, df), group in groups:
-        x = group["command_df"].to_numpy() + offsets[gait]
-        ax.scatter(x, group["achieved_df"], s=38, color=condition_color(gait, df), edgecolor="white", linewidth=0.6)
-    ax.plot([0.47, 0.78], [0.47, 0.78], ls="--", lw=1.2, color="#5B6573")
-    ax.set(xlim=(0.47, 0.78), ylim=(0.47, 0.78), xlabel="Commanded duty factor", ylabel="Achieved duty factor")
-    ax.set_xticks([0.50, 0.625, 0.75])
-    ax.set_title("b  Duty-factor commands are realized", loc="left", fontweight="bold")
-
-    ax = axes[1, 0]
-    for (gait, df), group in groups:
-        ax.plot(group["step_width"], group["lateral_rmse"], marker="o", lw=1.8, ms=5, color=condition_color(gait, df))
-    ax.axhline(0.10, ls="--", color=COLORS["failed"], lw=1.2, label="Frozen limit (0.10 m)")
-    ax.set(xlim=(0.08, 0.52), ylim=(0, 0.105), xlabel="Commanded full stance width (m)", ylabel="Lateral RMSE (m)")
-    ax.set_title("c  Robot stays near the straight line", loc="left", fontweight="bold")
-    ax.legend(loc="upper right")
-
-    ax = axes[1, 1]
-    for (gait, df), group in groups:
-        ax.plot(group["step_width"], group["heading_rmse_rad"], marker="o", lw=1.8, ms=5, color=condition_color(gait, df))
-    ax.axhline(0.10, ls="--", color=COLORS["failed"], lw=1.2, label="Frozen limit (0.10 rad)")
-    ax.set(xlim=(0.08, 0.52), ylim=(0, 0.105), xlabel="Commanded full stance width (m)", ylabel="Heading RMSE (rad)")
-    ax.set_title("d  Heading remains forward", loc="left", fontweight="bold")
-    ax.legend(loc="upper right")
-
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=5, frameon=False, bbox_to_anchor=(0.5, 0.995))
-    fig.suptitle("Flat-ground command validation: 1,280 held-out rollouts", fontsize=14, fontweight="bold", y=1.035)
-    fig.text(0.5, 0.005, "Seed-2 V4 evaluation; speed = 0.30 m/s, period = 0.48 s; each point summarizes 64 held-out rollouts.", ha="center", color="#4D5968", fontsize=9)
-    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
-    save_figure(fig, output, "figure_1_command_fidelity")
-
-    return {
-        "cells": int(len(nominal)),
-        "rollouts": int(nominal["n"].sum()),
-        "passing_cells": int(nominal["combined_cell_pass"].astype(bool).sum()),
-        "max_width_abs_error_m": float((nominal["body_achieved_width"] - nominal["step_width"]).abs().max()),
-        "max_df_abs_error": float((nominal["achieved_df"] - nominal["command_df"]).abs().max()),
-        "max_speed_abs_error_mps": float((nominal["forward_speed"] - 0.30).abs().max()),
-        "max_lateral_rmse_m": float(nominal["lateral_rmse"].max()),
-        "max_heading_rmse_rad": float(nominal["heading_rmse_rad"].max()),
-    }
+def quartiles(values):
+    values = sorted(values)
+    if len(values) < 2:
+        return values[0], values[0]
+    q = st.quantiles(values, n=4)
+    return q[0], q[2]
 
 
-def make_periodicity_figure(references: pd.DataFrame, output: Path) -> pd.DataFrame:
-    radius = references[np.isclose(references["perturbation_h"], 0.05)].copy()
-    summary = (
-        radius.groupby(["gait", "command_df"], as_index=False)
-        .agg(references=("periodic_orbit_gate_pass", "size"), passed=("periodic_orbit_gate_pass", "sum"), periodic_rate=("periodic_orbit_gate_pass", "mean"))
-    )
-    summary["label"] = [condition_label(g, d) for g, d in zip(summary["gait"], summary["command_df"])]
-    colors = [condition_color(g, d) for g, d in zip(summary["gait"], summary["command_df"])]
-
-    fig, ax = plt.subplots(figsize=(8.8, 5.1))
-    x = np.arange(len(summary))
-    bars = ax.bar(x, 100 * summary["periodic_rate"], color=colors, width=0.68)
-    for bar, row in zip(bars, summary.itertuples()):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.7, f"{100*row.periodic_rate:.1f}%\n({row.passed}/{row.references})", ha="center", va="bottom", fontsize=9)
-    ax.axhline(90, ls="--", lw=1.2, color=COLORS["failed"], label="Frozen coverage target (90%)")
-    ax.set_xticks(x, summary["label"])
-    ax.set_ylim(0, 113)
-    ax.set_ylabel("References passing phase-one periodicity gate (%)")
-    ax.set_title("Low-duty-factor trot is the only periodicity bottleneck", loc="left", fontsize=13, fontweight="bold")
-    ax.legend(loc="lower right", frameon=False)
-    fig.text(0.5, -0.01, "Diagnostic only: this gate is a prerequisite for the return map and is not the paper's convergence metric χ.", ha="center", color=COLORS["failed"], fontsize=9.3, fontweight="bold")
-    fig.tight_layout(rect=(0, 0.04, 1, 1))
-    save_figure(fig, output, "figure_2_periodicity_diagnostic")
-    return summary
+def load_sweep(results, tag, gait):
+    path = results / f"narrow_surfaces_sweep_{gait}_{tag}/grid/surface_trials.csv"
+    rows = list(csv.DictReader(path.open()))
+    keep = balanced_periods({(round(float(r["period"]), 2), (round(float(r["speed"]), 2), round(float(r["step_width"]), 2),
+                                                             round(float(r["command_df"]), 3))) for r in rows})
+    return [r for r in rows if round(float(r["period"]), 2) in keep], keep
 
 
-def make_energy_coverage_figure(energy: pd.DataFrame, output: Path) -> pd.DataFrame:
-    coverage = (
-        energy.groupby(["gait", "command_df", "speed"], as_index=False)
-        .agg(valid_widths=("energy_condition_valid", "sum"), widths=("energy_condition_valid", "size"))
-    )
-    coverage["coverage"] = coverage["valid_widths"] / coverage["widths"]
-    row_order = [("trot", 0.50), ("trot", 0.625), ("trot", 0.75), ("walk", 0.75)]
-    speeds = sorted(coverage["speed"].unique())
-    matrix = np.zeros((len(row_order), len(speeds)))
-    counts = np.zeros_like(matrix, dtype=int)
-    for i, (gait, df) in enumerate(row_order):
-        for j, speed in enumerate(speeds):
-            row = coverage[(coverage["gait"] == gait) & np.isclose(coverage["command_df"], df) & np.isclose(coverage["speed"], speed)].iloc[0]
-            matrix[i, j] = row["coverage"]
-            counts[i, j] = int(row["valid_widths"])
-
-    fig, ax = plt.subplots(figsize=(8.7, 5.1))
-    image = ax.imshow(matrix, vmin=0, vmax=1, cmap="YlGn", aspect="auto")
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            color = "white" if matrix[i, j] > 0.67 else COLORS["ink"]
-            ax.text(j, i, f"{counts[i,j]}/5", ha="center", va="center", color=color, fontweight="bold", fontsize=10)
-    ax.set_xticks(range(len(speeds)), [f"{s:.2f}" for s in speeds])
-    ax.set_yticks(range(len(row_order)), [condition_label(g, d) for g, d in row_order])
-    ax.set_xlabel("Commanded speed (m/s)")
-    ax.set_ylabel("Gait condition")
-    ax.set_title("Mechanical-CoT validity coverage is factor dependent", loc="left", fontsize=13, fontweight="bold")
-    cbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Fraction of stance widths valid")
-    fig.text(0.5, -0.01, "Only 65/80 cells are valid; missing low-DF trot cells prevent unbiased efficiency correlations.", ha="center", color=COLORS["failed"], fontsize=9.3, fontweight="bold")
-    fig.tight_layout(rect=(0, 0.04, 1, 1))
-    save_figure(fig, output, "figure_3_energy_validity_coverage")
-    return coverage
+def heatmap(ax, values, rows, columns, fmt, vmin, vmax):
+    """values[(row, column)] -> number; rows drawn bottom to top."""
+    grid = [[values.get((r, c), float("nan")) for c in columns] for r in rows]
+    image = ax.imshow(grid, origin="lower", aspect="auto", cmap=SEQUENTIAL, vmin=vmin, vmax=vmax)
+    for i, r in enumerate(rows):
+        for j, c in enumerate(columns):
+            v = grid[i][j]
+            if not math.isnan(v):
+                light = (v - vmin) / (vmax - vmin) < .55
+                ax.text(j, i, fmt(v), ha="center", va="center", fontsize=7,
+                        color=TEXT if light else "#ffffff")
+    ax.set_xticks(range(len(columns)), [f"{c:g}" for c in columns])
+    ax.set_yticks(range(len(rows)), [f"{r:.2f}" for r in rows])
+    ax.tick_params(colors=MUTED, labelsize=8, length=0)
+    for side in ax.spines.values():
+        side.set_visible(False)
+    return image
 
 
-def make_estimator_figure(pilot: pd.DataFrame, output: Path) -> dict[str, float | int]:
-    pilot = pilot.sort_values("perturbation_h")
-    h = pilot["perturbation_h"].to_numpy()
-    noise_ratio = pilot["zero_clone_noise_fraction_of_h"].to_numpy()
-    translation = pilot["translation_identity_residual_max"].to_numpy()
-    topology = pilot["hybrid_topology_gate_pass"].astype(bool).to_numpy()
-
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.6))
-    ax = axes[0]
-    ax.plot(h, noise_ratio, marker="o", ms=6, lw=2, color=COLORS["failed"])
-    ax.axhline(0.05, ls="--", lw=1.3, color=COLORS["ink"], label="Required maximum")
-    ax.set(xscale="log", yscale="log", xlabel="Finite-difference radius h", ylabel="Zero-clone divergence / h")
-    ax.set_xticks(h, [f"{x:g}" for x in h])
-    ax.set_title("a  Hidden-state noise exceeds every radius", loc="left", fontweight="bold")
-    ax.legend(frameon=False)
-
-    ax = axes[1]
-    for x, y, passed in zip(h, translation, topology):
-        ax.scatter(x, y, s=70, marker="o" if passed else "X", color=COLORS["diagnostic"] if passed else COLORS["failed"], edgecolor="white", linewidth=0.7, zorder=3)
-    ax.plot(h, translation, lw=1.7, color=COLORS["diagnostic"], alpha=0.8)
-    ax.axhline(0.02, ls="--", lw=1.3, color=COLORS["ink"], label="Required maximum")
-    ax.set(xscale="log", yscale="log", xlabel="Finite-difference radius h", ylabel="Translation-identity residual")
-    ax.set_xticks(h, [f"{x:g}" for x in h])
-    ax.set_title("b  Translation check also fails", loc="left", fontweight="bold")
-    legend = [
-        Line2D([0], [0], marker="o", color="none", markerfacecolor=COLORS["diagnostic"], markeredgecolor="white", markersize=8, label="Topology preserved"),
-        Line2D([0], [0], marker="X", color="none", markerfacecolor=COLORS["failed"], markeredgecolor="white", markersize=8, label="Topology changed"),
-    ]
-    ax.legend(handles=legend, frameon=False, loc="upper right")
-
-    fig.suptitle("Return-map validity audit: no χ estimate is releasable", fontsize=14, fontweight="bold")
-    fig.text(0.5, -0.015, "The pilot validates the exposed-state fork but fails reproducibility and symmetry; raw χ values are intentionally suppressed.", ha="center", color=COLORS["failed"], fontsize=9.3, fontweight="bold")
-    fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-    save_figure(fig, output, "figure_4_return_map_validity")
-    return {
-        "radii_tested": int(len(pilot)),
-        "valid_chi_estimates": int(pilot["reference_valid"].astype(bool).sum()),
-        "zero_clone_output_norm": float(pilot["zero_clone_output_max_error"].max()),
-        "min_noise_over_h": float(noise_ratio.min()),
-        "max_noise_over_h": float(noise_ratio.max()),
-        "topology_passing_radii": int(topology.sum()),
-        "translation_passing_radii": int((translation <= 0.02).sum()),
-    }
+def figure_periodicity(results, tag, out):
+    table = []
+    for gait in GAITS:
+        rows, periods = load_sweep(results, tag, gait)
+        cells = defaultdict(list)
+        for r in rows:
+            if r["cycle_rms"] not in ("", "nan"):
+                cells[(round(float(r["step_width"]), 2), round(float(r["command_df"]), 3))].append(r)
+        for (w, d), rs in sorted(cells.items()):
+            q = quartiles(float(r["cycle_rms"]) for r in rs)
+            table.append({"gait": gait, "step_width": w, "command_df": d,
+                          "achieved_df_median": st.median(float(r["achieved_df"]) for r in rs),
+                          "cycle_rms_median": st.median(float(r["cycle_rms"]) for r in rs),
+                          "cycle_rms_q25": q[0], "cycle_rms_q75": q[1],
+                          "trials": len(rs), "periods": " ".join(f"{p:g}" for p in periods)})
+    widths = sorted({t["step_width"] for t in table})
+    fig, axes = plt.subplots(1, len(widths), figsize=(2.1 * len(widths), 2.9), sharey=True, sharex=True,
+                             squeeze=False)
+    axes = axes[0]
+    for ax, w in zip(axes, widths):
+        for gait in GAITS:
+            pts = sorted((t for t in table if t["gait"] == gait and t["step_width"] == w),
+                         key=lambda t: t["achieved_df_median"])
+            x = [t["achieved_df_median"] for t in pts]
+            ax.fill_between(x, [t["cycle_rms_q25"] for t in pts], [t["cycle_rms_q75"] for t in pts],
+                            color=GAIT_COLORS[gait], alpha=.15, lw=0)
+            ax.plot(x, [t["cycle_rms_median"] for t in pts], color=GAIT_COLORS[gait], lw=2, marker="o",
+                    ms=4, label=gait.capitalize())
+        ax.set_yscale("log")
+        ax.set_title(f"Stance width {w:.2f} m", color=TEXT, fontsize=10)
+        ax.set_xlabel("Realized duty factor", color=TEXT, fontsize=9)
+        style(ax)
+    axes[0].set_ylabel("Periodicity error (lower is more repeatable)", color=TEXT, fontsize=9)
+    axes[-1].legend(frameon=False, fontsize=8, labelcolor=TEXT, loc="upper right")
+    save(fig, out, "fig1_periodicity_vs_duty_factor", table)
 
 
-def make_claim_status_figure(output: Path) -> pd.DataFrame:
-    rows = [
-        ("Policy executes width, DF and gait\nwhile walking straight", "Supported", "20/20 cells; 1,280/1,280 rollouts"),
-        ("Higher DF improves convergence", "Diagnostic only", "Periodicity: 61.25% at trot DF 0.50; 100% otherwise"),
-        ("Narrower stance worsens convergence", "Missing", "No valid χ-by-width comparison"),
-        ("Speed has weak convergence effect", "Missing", "0.25–0.40 m/s ran; χ invalid, so no usable comparison"),
-        ("Matched walk and trot converge similarly", "Missing", "No valid χ-by-gait comparison"),
-        ("DF and speed affect efficiency; gait is weak", "Suppressed", "65/80 valid CoT cells; missingness depends on factors"),
-        ("Width has little efficiency effect", "Suppressed", "Incomplete matched CoT pairs"),
-    ]
-    status = pd.DataFrame(rows, columns=["claim", "status", "evidence"])
-    status_colors = {
-        "Supported": COLORS["pass"],
-        "Diagnostic only": COLORS["diagnostic"],
-        "Suppressed": COLORS["failed"],
-        "Missing": COLORS["missing"],
-    }
-
-    fig, ax = plt.subplots(figsize=(13.5, 7.0))
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    ax.text(0.02, 0.965, "Evidence status against the paper's claims", fontsize=16, fontweight="bold", va="top")
-    ax.text(0.02, 0.885, "Claim", fontweight="bold", color="#596575")
-    ax.text(0.43, 0.885, "Status", fontweight="bold", color="#596575", ha="center")
-    ax.text(0.56, 0.885, "Current evidence", fontweight="bold", color="#596575")
-
-    row_top = 0.85
-    row_height = 0.105
-    for idx, row in status.iterrows():
-        y_top = row_top - idx * row_height
-        y_mid = y_top - row_height / 2
-        if idx % 2 == 0:
-            ax.add_patch(Rectangle((0.012, y_top - row_height), 0.976, row_height, facecolor="#F6F8FA", edgecolor="none"))
-        ax.text(0.02, y_mid, row["claim"], ha="left", va="center", fontsize=10, fontweight="bold")
-        color = status_colors[row["status"]]
-        ax.add_patch(
-            FancyBboxPatch(
-                (0.355, y_mid - 0.025),
-                0.15,
-                0.05,
-                boxstyle="round,pad=0.006,rounding_size=0.012",
-                facecolor=color,
-                edgecolor="none",
-            )
-        )
-        label_color = COLORS["ink"] if row["status"] == "Missing" else "white"
-        ax.text(0.43, y_mid, row["status"], ha="center", va="center", color=label_color, fontweight="bold", fontsize=9.2)
-        ax.text(0.56, y_mid, row["evidence"], ha="left", va="center", fontsize=9.4, color=COLORS["ink"])
-
-    fig.text(0.5, 0.025, "Flat-ground, forward-only scope; nominal motor gains; one trained seed. χ claims require a valid estimator and independent policies.", ha="center", fontsize=9, color="#4D5968")
-    fig.subplots_adjust(left=0.025, right=0.985, top=0.985, bottom=0.07)
-    save_figure(fig, output, "figure_5_paper_claim_status")
-    return status
+def figure_cot(results, tag, out):
+    table = []
+    for gait in GAITS:
+        rows, periods = load_sweep(results, tag, gait)
+        cells = defaultdict(list)
+        for r in rows:
+            cot = r["positive_mechanical_cot"]
+            if r["any_failure"] not in ("1", "True") and cot not in ("", "nan") and float(cot) > 0:
+                cells[(round(float(r["step_width"]), 2), round(float(r["command_df"]), 3))].append(r)
+        for (w, d), rs in sorted(cells.items()):
+            table.append({"gait": gait, "step_width": w, "command_df": d,
+                          "achieved_df_median": st.median(float(r["achieved_df"]) for r in rs),
+                          "positive_mechanical_cot_median": st.median(float(r["positive_mechanical_cot"]) for r in rs),
+                          "trials": len(rs), "periods": " ".join(f"{p:g}" for p in periods)})
+    widths = sorted({t["step_width"] for t in table})
+    fig, axes = plt.subplots(1, len(widths), figsize=(2.1 * len(widths), 2.9), sharey=True, sharex=True,
+                             squeeze=False)
+    axes = axes[0]
+    for ax, w in zip(axes, widths):
+        for gait in GAITS:
+            pts = sorted((t for t in table if t["gait"] == gait and t["step_width"] == w),
+                         key=lambda t: t["achieved_df_median"])
+            ax.plot([t["achieved_df_median"] for t in pts], [t["positive_mechanical_cot_median"] for t in pts],
+                    color=GAIT_COLORS[gait], lw=2, marker="o", ms=4, label=gait.capitalize())
+        ax.set_title(f"Stance width {w:.2f} m", color=TEXT, fontsize=10)
+        ax.set_xlabel("Realized duty factor", color=TEXT, fontsize=9)
+        style(ax)
+    axes[0].set_ylabel("Cost of transport", color=TEXT, fontsize=9)
+    axes[-1].legend(frameon=False, fontsize=8, labelcolor=TEXT, loc="upper left")
+    save(fig, out, "fig2_cot_vs_duty_factor", table)
 
 
-def make_factor_space_figure(
-    references: pd.DataFrame, energy: pd.DataFrame, output: Path
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    energy = energy.copy()
-    energy["valid"] = energy["energy_condition_valid"].astype(bool)
-    energy_rows = []
-    for (gait, duty_factor, speed), group in energy.groupby(["gait", "command_df", "speed"]):
-        valid = group[group["valid"]]
-        energy_rows.append(
-            {
-                "gait": gait,
-                "command_df": duty_factor,
-                "speed": speed,
-                "valid_widths": int(len(valid)),
-                "total_widths": int(len(group)),
-                "positive_mechanical_cot_median": float(valid["positive_mechanical_cot_median"].median()) if len(valid) else np.nan,
-            }
-        )
-    cot = pd.DataFrame(energy_rows).sort_values(["gait", "command_df", "speed"])
-
-    radius = references[np.isclose(references["perturbation_h"], 0.05)]
-    periodicity = (
-        radius.groupby(["gait", "command_df", "speed"], as_index=False)
-        .agg(references=("reference", "size"), periodic_rate=("periodic_orbit_gate_pass", "mean"))
-        .sort_values(["gait", "command_df", "speed"])
-    )
-
-    fig = plt.figure(figsize=(13.0, 6.2))
-    ax_cot = fig.add_subplot(1, 2, 1, projection="3d")
-    for (gait, duty_factor), group in cot.groupby(["gait", "command_df"], sort=True):
-        group = group.sort_values("speed")
-        valid = group["positive_mechanical_cot_median"].notna()
-        color = condition_color(gait, duty_factor)
-        sizes = 45 + 85 * group.loc[valid, "valid_widths"] / group.loc[valid, "total_widths"]
-        ax_cot.plot(
-            group.loc[valid, "speed"],
-            group.loc[valid, "command_df"],
-            group.loc[valid, "positive_mechanical_cot_median"],
-            color=color,
-            lw=1.8,
-            alpha=0.85,
-        )
-        ax_cot.scatter(
-            group.loc[valid, "speed"],
-            group.loc[valid, "command_df"],
-            group.loc[valid, "positive_mechanical_cot_median"],
-            s=sizes,
-            color=color,
-            edgecolor="white",
-            linewidth=0.8,
-            depthshade=False,
-        )
-        missing = ~valid
-        if missing.any():
-            ax_cot.scatter(
-                group.loc[missing, "speed"],
-                group.loc[missing, "command_df"],
-                np.full(int(missing.sum()), 0.185),
-                marker="X",
-                s=85,
-                color=COLORS["failed"],
-                depthshade=False,
-            )
-    ax_cot.set(
-        xlabel="Speed (m/s)",
-        ylabel="Duty factor",
-        zlabel="Positive mechanical CoT",
-        xlim=(0.235, 0.415),
-        ylim=(0.48, 0.77),
-        zlim=(0.18, 0.42),
-    )
-    ax_cot.set_xticks([0.25, 0.30, 0.35, 0.40])
-    ax_cot.set_yticks([0.50, 0.625, 0.75])
-    ax_cot.view_init(elev=24, azim=-58)
-    ax_cot.set_title("a  Mechanical CoT (valid cells only)", loc="left", fontweight="bold", pad=12)
-
-    ax_periodic = fig.add_subplot(1, 2, 2, projection="3d")
-    for (gait, duty_factor), group in periodicity.groupby(["gait", "command_df"], sort=True):
-        group = group.sort_values("speed")
-        color = condition_color(gait, duty_factor)
-        ax_periodic.plot(
-            group["speed"],
-            group["command_df"],
-            100 * group["periodic_rate"],
-            marker="o",
-            ms=6,
-            lw=2,
-            color=color,
-            label=condition_label(gait, duty_factor),
-        )
-    ax_periodic.set(
-        xlabel="Speed (m/s)",
-        ylabel="Duty factor",
-        zlabel="Phase-one periodicity (%)",
-        xlim=(0.235, 0.415),
-        ylim=(0.48, 0.77),
-        zlim=(0, 105),
-    )
-    ax_periodic.set_xticks([0.25, 0.30, 0.35, 0.40])
-    ax_periodic.set_yticks([0.50, 0.625, 0.75])
-    ax_periodic.zaxis.labelpad = 1
-    ax_periodic.view_init(elev=24, azim=-58)
-    ax_periodic.set_title("b  Periodicity prerequisite (not χ)", loc="left", fontweight="bold", pad=12)
-
-    legend_handles = [
-        Line2D([0], [0], marker="o", color=COLORS["trot_050"], lw=2, label="Trot, DF 0.50"),
-        Line2D([0], [0], marker="o", color=COLORS["trot_0625"], lw=2, label="Trot, DF 0.625"),
-        Line2D([0], [0], marker="o", color=COLORS["trot_075"], lw=2, label="Trot, DF 0.75"),
-        Line2D([0], [0], marker="o", color=COLORS["walk_075"], lw=2, label="Walk, DF 0.75"),
-        Line2D([0], [0], marker="X", color="none", markerfacecolor=COLORS["failed"], markeredgecolor=COLORS["failed"], label="Invalid CoT cell"),
-    ]
-    fig.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=5, frameon=False)
-    fig.suptitle("Speed × duty-factor view of the available evidence", fontsize=15, fontweight="bold", y=1.01)
-    fig.text(
-        0.5,
-        0.015,
-        "Descriptive seed-2 data. CoT missingness depends on the factors; periodicity is a convergence prerequisite, not the paper's χ metric.",
-        ha="center",
-        color=COLORS["failed"],
-        fontsize=9.2,
-        fontweight="bold",
-    )
-    fig.subplots_adjust(left=0.01, right=0.93, top=0.86, bottom=0.10, wspace=0.08)
-    save_figure(fig, output, "figure_6_speed_df_cot_periodicity_3d")
-    return cot, periodicity
+def figure_push(results, tag, out):
+    table = []
+    for gait in GAITS:
+        levels = {}
+        for force, level in ((25, ""), (50, "_f50")):
+            levels[force] = {p: list(json.loads((d / "perturbation_summary.json").read_text())["conditions"].values())
+                             for p, d in runs(results, f"push_robustness_narrow_{gait}_v030_", f"{level}_{tag}").items()
+                             if (d / "perturbation_summary.json").exists()}
+        if not levels[25]:
+            continue
+        keep = balanced_periods({(p, (round(c["step_width"], 2), round(c["df"], 3)))
+                                 for p, cs in levels[25].items() for c in cs})
+        for force, summaries in levels.items():
+            if not keep or any(p not in summaries for p in keep):
+                continue
+            counts = defaultdict(lambda: [0, 0])
+            for p in keep:
+                for c in summaries[p]:
+                    k = (round(c["step_width"], 2), round(c["df"], 3))
+                    counts[k][0] += c["success"]
+                    counts[k][1] += c["trials"]
+            for (w, d), (s_, n) in sorted(counts.items()):
+                if n == 0:
+                    continue
+                low, high = wilson(s_, n)
+                table.append({"gait": gait, "push_force_n": force, "step_width": w, "command_df": d,
+                              "success": s_, "trials": n, "success_rate": s_ / n, "ci_low": low, "ci_high": high,
+                              "periods": " ".join(f"{p:g}" for p in keep)})
+    forces = sorted({t["push_force_n"] for t in table})
+    fig, axes = plt.subplots(len(forces), 2, figsize=(9.6, 3.6 * len(forces)), sharex=True, sharey=True,
+                             squeeze=False)
+    for i, force in enumerate(forces):
+        for j, gait in enumerate(GAITS):
+            ax = axes[i, j]
+            cells = [t for t in table if t["gait"] == gait and t["push_force_n"] == force]
+            if not cells:
+                ax.axis("off")
+                continue
+            duties = sorted({t["command_df"] for t in cells})
+            colors = DUTY_RAMP if len(duties) > 4 else ("#86b6ef", "#3987e5", "#1c5cab", "#0d366b")[-len(duties):]
+            for k, (d, color) in enumerate(zip(duties, colors)):
+                pts = sorted((t for t in cells if t["command_df"] == d), key=lambda t: t["step_width"])
+                y = [100 * t["success_rate"] for t in pts]
+                err = [[max(0., 100 * (t["success_rate"] - t["ci_low"])) for t in pts],
+                       [max(0., 100 * (t["ci_high"] - t["success_rate"])) for t in pts]]
+                ax.errorbar([t["step_width"] for t in pts], y, yerr=err, color=color, lw=2,
+                            marker=MARKERS[k % len(MARKERS)], ms=5, elinewidth=.8, capsize=0, label=f"{d:g}")
+            ax.set_ylim(-3, 103)
+            ax.set_title(gait.capitalize(), color=TEXT, fontsize=10)
+            if i == len(forces) - 1:
+                ax.set_xlabel("Stance width (m)", color=TEXT, fontsize=9)
+            label = "Success rate (%)" if len(forces) == 1 else f"Success rate (%), disturbance up to {force} N"
+            ax.set_ylabel(label, color=TEXT, fontsize=9)
+            ax.legend(frameon=False, fontsize=8, labelcolor=TEXT, title="Duty factor", title_fontsize=8,
+                      loc="lower right")
+            style(ax)
+    save(fig, out, "fig3_robustness_vs_stance_width", table)
 
 
-def make_paper_style_surfaces(
-    cot: pd.DataFrame, periodicity: pd.DataFrame, output: Path
-) -> None:
-    """Render response surfaces in the layout used by the reference paper."""
-
-    trot_cot = cot[cot["gait"] == "trot"].pivot(
-        index="speed", columns="command_df", values="positive_mechanical_cot_median"
-    ).sort_index().sort_index(axis=1)
-    trot_periodicity = periodicity[periodicity["gait"] == "trot"].pivot(
-        index="speed", columns="command_df", values="periodic_rate"
-    ).sort_index().sort_index(axis=1)
-    walk_cot = cot[cot["gait"] == "walk"].sort_values("speed")
-    walk_periodicity = periodicity[periodicity["gait"] == "walk"].sort_values("speed")
-
-    fig = plt.figure(figsize=(12.5, 8.1))
-    ax_cot = fig.add_subplot(2, 1, 1, projection="3d")
-    duty_grid, speed_grid = np.meshgrid(
-        trot_cot.columns.to_numpy(), trot_cot.index.to_numpy()
-    )
-    ax_cot.plot_surface(
-        duty_grid,
-        speed_grid,
-        trot_cot.to_numpy(),
-        color="#0072BD",
-        edgecolor="#0072BD",
-        linewidth=0.65,
-        alpha=0.82,
-        antialiased=True,
-    )
-    ax_cot.plot(
-        walk_cot["command_df"],
-        walk_cot["speed"],
-        walk_cot["positive_mechanical_cot_median"],
-        color="#D95319",
-        marker="s",
-        ms=6,
-        lw=3,
-        label="Walk (measured at DF 0.75 only)",
-    )
-    missing = trot_cot.isna().stack()
-    for (speed, duty_factor), is_missing in missing.items():
-        if is_missing:
-            ax_cot.scatter(
-                duty_factor,
-                speed,
-                0.185,
-                marker="X",
-                s=70,
-                color=COLORS["failed"],
-                depthshade=False,
-            )
-    ax_cot.set(
-        xlabel="Duty factor",
-        ylabel="Speed (m/s)",
-        zlabel="Positive mechanical CoT",
-        xlim=(0.48, 0.77),
-        ylim=(0.24, 0.41),
-        zlim=(0.18, 0.42),
-    )
-    ax_cot.set_xticks([0.50, 0.625, 0.75])
-    ax_cot.set_yticks([0.25, 0.30, 0.35, 0.40])
-    ax_cot.view_init(elev=24, azim=-52)
-    ax_cot.set_title("a  Cost of transport", loc="left", fontsize=12, fontweight="bold")
-
-    ax_periodic = fig.add_subplot(2, 1, 2, projection="3d")
-    duty_grid, speed_grid = np.meshgrid(
-        trot_periodicity.columns.to_numpy(), trot_periodicity.index.to_numpy()
-    )
-    ax_periodic.plot_surface(
-        duty_grid,
-        speed_grid,
-        trot_periodicity.to_numpy(),
-        color="#0072BD",
-        edgecolor="#0072BD",
-        linewidth=0.65,
-        alpha=0.82,
-        antialiased=True,
-    )
-    ax_periodic.plot(
-        walk_periodicity["command_df"],
-        walk_periodicity["speed"],
-        walk_periodicity["periodic_rate"],
-        color="#D95319",
-        marker="s",
-        ms=6,
-        lw=3,
-    )
-    ax_periodic.set(
-        xlabel="Duty factor",
-        ylabel="Speed (m/s)",
-        zlabel="Periodicity rate",
-        xlim=(0.48, 0.77),
-        ylim=(0.24, 0.41),
-        zlim=(0.45, 1.03),
-    )
-    ax_periodic.set_xticks([0.50, 0.625, 0.75])
-    ax_periodic.set_yticks([0.25, 0.30, 0.35, 0.40])
-    ax_periodic.view_init(elev=24, azim=-52)
-    ax_periodic.set_title(
-        "b  Convergence prerequisite: phase-one periodicity (not χ)",
-        loc="left",
-        fontsize=12,
-        fontweight="bold",
-    )
-
-    handles = [
-        Patch(facecolor="#0072BD", edgecolor="#0072BD", label="Trot"),
-        Patch(facecolor="#D95319", edgecolor="#D95319", label="Walk"),
-        Line2D([0], [0], marker="X", color="none", markerfacecolor=COLORS["failed"], markeredgecolor=COLORS["failed"], label="Invalid/missing CoT"),
-    ]
-    fig.legend(handles=handles, loc="upper center", ncol=3, frameon=True,
-               fancybox=False, framealpha=1., edgecolor="#777777",
-               fontsize=11, bbox_to_anchor=(0.5, 0.955))
-    fig.suptitle("RL response surfaces in the paper's factor-space format", fontsize=15, fontweight="bold", y=0.995)
-    fig.text(
-        0.5,
-        0.018,
-        "Measured seed-2 data only: no walk surface was inferred from one duty-factor row, and no invalid χ estimate is displayed.",
-        ha="center",
-        color=COLORS["failed"],
-        fontsize=9.3,
-        fontweight="bold",
-    )
-    fig.subplots_adjust(left=0.02, right=0.94, top=0.90, bottom=0.075, hspace=0.20)
-    save_figure(fig, output, "figure_7_paper_style_rl_surfaces")
+def figure_realized_duty(results, tag, out):
+    table = []
+    for gait in GAITS:
+        summaries = {p: [r for r in csv.DictReader((d / "summary.csv").open()) if r["achieved_df"]]
+                     for p, d in runs(results, f"validation_narrow_{gait}_v030_", f"_{tag}").items()
+                     if (d / "summary.csv").exists()}
+        if not summaries:
+            continue
+        keep = balanced_periods({(p, (round(float(r["step_width"]), 2), round(float(r["command_df"]), 3)))
+                                 for p, rs in summaries.items() for r in rs})
+        cells = defaultdict(list)
+        for p in keep:
+            for r in summaries[p]:
+                cells[(round(float(r["step_width"]), 2), round(float(r["command_df"]), 3))].append(float(r["achieved_df"]))
+        for (w, d), v in sorted(cells.items()):
+            table.append({"gait": gait, "step_width": w, "command_df": d, "achieved_df_mean": st.mean(v),
+                          "periods": " ".join(f"{p:g}" for p in keep)})
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.6), layout="constrained")
+    for ax, gait in zip(axes, GAITS):
+        cells = [t for t in table if t["gait"] == gait]
+        if not cells:
+            ax.axis("off")
+            continue
+        widths = sorted({t["step_width"] for t in cells})
+        duties = sorted({t["command_df"] for t in cells})
+        image = heatmap(ax, {(t["step_width"], t["command_df"]): t["achieved_df_mean"] for t in cells},
+                        widths, duties, lambda v: f"{v:.2f}", .45, .95)
+        ax.set_title(gait.capitalize(), color=TEXT, fontsize=10)
+        ax.set_xlabel("Commanded duty factor", color=TEXT, fontsize=9)
+        ax.set_ylabel("Stance width (m)", color=TEXT, fontsize=9)
+    bar = fig.colorbar(image, ax=list(axes), fraction=.025, pad=.02)
+    bar.set_label("Realized duty factor", color=TEXT, fontsize=9)
+    bar.ax.tick_params(colors=MUTED, labelsize=8, length=0)
+    bar.outline.set_visible(False)
+    save(fig, out, "fig4_realized_duty_factor_by_width", table)
 
 
-def write_readme(output: Path, command: dict, estimator: dict) -> None:
-    text = f"""# Paper-claim figure set
+def figure_selector(results, tag, out):
+    """The selector network's duty factor for each of its speed and period contexts against stance
+    width, per gait, over the periods at which every duty factor ran: mean, interquartile range and
+    full range of the contexts at each width. Widths where no context is labelled have no point."""
+    fit = results / f"narrow_robust_selector_{tag}"
+    predictions = list(csv.DictReader((fit / "selector_predictions.csv").open()))
+    candidates = list(csv.DictReader((fit / "candidate_success.csv").open()))
+    rejected = (list(csv.DictReader((fit / "rejected_contexts.csv").open()))
+                if (fit / "rejected_contexts.csv").exists() else [])
+    report = results / f"narrow_robust_selector_promoted_{tag}/validation_report.json"
+    validated = json.loads(report.read_text())["all_contexts_passed"] if report.exists() else ""
+    table, curves = [], {}
+    for gait in GAITS:
+        grid = [r for r in candidates if r["gait"] == gait]
+        if not grid:
+            continue
+        keep = balanced_periods({(round(float(r["period"]), 2), (round(float(r["speed"]), 2),
+                                  round(float(r["step_width"]), 2), round(float(r["command_df"]), 3)))
+                                 for r in grid})
+        speeds = sorted({round(float(r["speed"]), 2) for r in grid})
+        at = lambda rows, w: [r for r in rows if r["gait"] == gait and round(float(r["period"]), 2) in keep
+                              and round(float(r["step_width"]), 2) == w]
+        curves[gait] = {}
+        for w in sorted({round(float(r["step_width"]), 2) for r in grid}):
+            chosen = sorted(float(r["selected_df"]) for r in at(predictions, w))
+            if chosen:
+                q25, q75 = (float(q) for q in np.quantile(chosen, [.25, .75], method="inverted_cdf"))
+                curves[gait][w] = (float(np.mean(chosen)), q25, q75, chosen[0], chosen[-1])
+            else:
+                curves[gait][w] = (None,) * 5
+            mean, q25, q75, low, high = curves[gait][w]
+            table.append({"gait": gait, "step_width": w, "contexts": len(chosen),
+                          "contexts_without_label": len(at(rejected, w)),
+                          "selected_df_mean": "" if mean is None else mean,
+                          "selected_df_q25": "" if q25 is None else q25,
+                          "selected_df_q75": "" if q75 is None else q75,
+                          "selected_df_min": "" if low is None else low,
+                          "selected_df_max": "" if high is None else high,
+                          "selections": " ".join(f"{d:g}x{chosen.count(d)}" for d in sorted(set(chosen))),
+                          "speeds": " ".join(f"{v:g}" for v in speeds),
+                          "periods": " ".join(f"{p:g}" for p in keep),
+                          "selector_validated": validated})
+    if not table:
+        raise FileNotFoundError("no selector fit")
+    tested = sorted({round(float(r["command_df"]), 3) for r in candidates})
+    ceiling = tested[-1] + .07
+    fig, ax = plt.subplots(figsize=(4.8, 3.6))
+    for j, (gait, points) in enumerate(curves.items()):
+        shift = (j - (len(curves) - 1) / 2) * .008
+        found = [(w + shift, *values) for w, values in sorted(points.items()) if values[0] is not None]
+        x = [row[0] for row in found]
+        ax.vlines(x, [row[4] for row in found], [row[5] for row in found], color=GAIT_COLORS[gait], lw=.8, alpha=.35)
+        ax.vlines(x, [row[2] for row in found], [row[3] for row in found], color=GAIT_COLORS[gait], lw=1.8)
+        ax.plot(x, [row[1] for row in found], color=GAIT_COLORS[gait], lw=2, marker="o",
+                ms=5, label=gait.capitalize())
+        none = [w + shift for w, values in sorted(points.items()) if values[0] is None]
+        ax.plot(none, [ceiling] * len(none), ls="none", marker="x", ms=6, mew=1.6, color=GAIT_COLORS[gait])
+    ax.plot([], [], ls="none", marker="x", ms=6, mew=1.6, color=MUTED, label="no duty factor reaches 5% success")
+    widths = sorted({t["step_width"] for t in table})
+    ax.set_xticks(widths, [f"{w:.2f}" for w in widths])
+    ax.set_yticks(tested, [f"{d:g}" for d in tested])
+    ax.set_yticks([ceiling], ["none"], minor=True)
+    ax.tick_params(axis="y", which="minor", colors=MUTED, labelsize=8, length=0)
+    ax.set_ylim(tested[0] - .03, ceiling + .03)
+    ax.spines["left"].set_bounds(tested[0] - .03, tested[-1] + .02)
+    ax.set_xlabel("Stance width (m)", color=TEXT, fontsize=9)
+    ax.set_ylabel("Duty factor chosen by the selector", color=TEXT, fontsize=9)
+    legend = ax.legend(frameon=True, facecolor="#ffffff", edgecolor="none", framealpha=1, fontsize=8,
+                       labelcolor=TEXT, loc="upper right")
+    legend.set_zorder(5)
+    style(ax)
+    save(fig, out, "fig5_selector_duty_factor_vs_stance_width", table)
 
-These figures are generated from the audited seed-2 flat-ground evaluations.
-All PNG files are directly in this folder; the matching PDFs are vector exports.
 
-| Figure | What it establishes | Scientific limit |
-|---|---|---|
-| `figure_1_command_fidelity` | The policy realizes commanded stance width and duty factor while tracking 0.30 m/s and staying straight. All {command['passing_cells']}/{command['cells']} cells passed ({command['rollouts']} rollouts). | This validates the treatment variables; it is not a convergence result. |
-| `figure_2_periodicity_diagnostic` | Low-DF trot is the only stratum with reduced phase-one periodicity (61.25% versus 100%). | Directionally agrees with the paper's duty-factor claim, but periodicity is not chi. |
-| `figure_3_energy_validity_coverage` | Shows exactly where mechanical-CoT data pass the validity gate. | Only 65/80 cells pass and missingness is factor dependent, so efficiency correlations are suppressed. |
-| `figure_4_return_map_validity` | Explains why the return-map result is withheld: zero-clone noise and translation symmetry fail at every tested radius. | {estimator['valid_chi_estimates']} valid chi estimates; raw values must not be shown as policy evidence. |
-| `figure_5_paper_claim_status` | Slide-ready map from each paper claim to the evidence currently available. | A single trained seed cannot establish population-level paper replication. |
-| `figure_6_speed_df_cot_periodicity_3d` | Three-axis view of speed, duty factor, mechanical CoT, and the periodicity prerequisite. | CoT is descriptive with factor-dependent missingness; periodicity is not chi. |
-| `figure_7_paper_style_rl_surfaces` | Paper-style response-surface layout using the RL measurements. | Trot forms a measured surface; walk has only one duty-factor row, and periodicity replaces unavailable chi only as a labeled diagnostic. |
-
-## Direct quantitative result
-
-- Maximum stance-width error across cell means: {command['max_width_abs_error_m']:.4f} m.
-- Maximum duty-factor error across cell means: {command['max_df_abs_error']:.4f}.
-- Maximum speed error from 0.30 m/s: {command['max_speed_abs_error_mps']:.4f} m/s.
-- Maximum lateral RMSE: {command['max_lateral_rmse_m']:.4f} m, against the 0.10 m limit.
-- Maximum heading RMSE: {command['max_heading_rmse_rad']:.4f} rad, against the 0.10 rad limit.
-
-## Source data
-
-- `results/validation_v4_seed2_v030_p048_trot_20260911/summary.csv`
-- `results/validation_v4_seed2_v030_p048_walk_20260911/summary.csv`
-- `results/stability_v4_seed2_descriptive_20260911/stability_references.csv`
-- `results/stability_v4_seed2_descriptive_20260911/paper_energy_conditions.csv`
-- `results/stability_v5_estimator_pilot_seed1100000_20260911/stability_references.csv`
-
-Regenerate with `python scripts/make_paper_figures.py`. No simulator or GPU is used.
-"""
-    (output / "README.md").write_text(text)
-
-
-def parse_args() -> argparse.Namespace:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trot-summary", type=Path, default=DEFAULT_TROT)
-    parser.add_argument("--walk-summary", type=Path, default=DEFAULT_WALK)
-    parser.add_argument("--stability-dir", type=Path, default=DEFAULT_STABILITY)
-    parser.add_argument("--pilot", type=Path, default=DEFAULT_PILOT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    output = args.output.resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    configure_plotting()
-
-    nominal = load_nominal(args.trot_summary, args.walk_summary)
-    references = pd.read_csv(args.stability_dir / "stability_references.csv")
-    energy = pd.read_csv(args.stability_dir / "paper_energy_conditions.csv")
-    pilot = pd.read_csv(args.pilot)
-
-    command_metrics = make_command_figure(nominal, output)
-    periodicity = make_periodicity_figure(references, output)
-    energy_coverage = make_energy_coverage_figure(energy, output)
-    estimator_metrics = make_estimator_figure(pilot, output)
-    claim_status = make_claim_status_figure(output)
-    cot_factor_space, periodicity_factor_space = make_factor_space_figure(references, energy, output)
-    make_paper_style_surfaces(cot_factor_space, periodicity_factor_space, output)
-
-    nominal.to_csv(output / "figure_1_command_fidelity_data.csv", index=False)
-    periodicity.to_csv(output / "figure_2_periodicity_data.csv", index=False)
-    energy_coverage.to_csv(output / "figure_3_energy_coverage_data.csv", index=False)
-    pilot.to_csv(output / "figure_4_estimator_validity_data.csv", index=False)
-    claim_status.to_csv(output / "figure_5_claim_status_data.csv", index=False)
-    cot_factor_space.to_csv(output / "figure_6_cot_speed_df_data.csv", index=False)
-    periodicity_factor_space.to_csv(output / "figure_6_periodicity_speed_df_data.csv", index=False)
-    metrics = {"command_fidelity": command_metrics, "estimator_validity": estimator_metrics}
-    (output / "key_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-    write_readme(output, command_metrics, estimator_metrics)
-    print(f"Wrote paper figures to {output}")
+    parser.add_argument("--results", type=Path, default=ROOT / "results")
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    for stale in args.output.glob("fig[0-9]_*"):
+        stale.unlink()
+    missing = []
+    for figure in (figure_periodicity, figure_cot, figure_push, figure_realized_duty, figure_selector):
+        try:
+            figure(args.results, args.tag, args.output)
+        except Exception as error:
+            missing.append(f"{figure.__name__}: {type(error).__name__}: {error}")
+    for line in missing:
+        print("FIGURE_SKIPPED", line)
+    raise SystemExit(1 if missing else 0)
 
 
 if __name__ == "__main__":
