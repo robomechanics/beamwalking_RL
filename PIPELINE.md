@@ -10,8 +10,8 @@ One trot and one walk policy for the Unitree Go2 on flat ground, each commanded
 by forward speed, duty factor, full stance width, gait period and gait. Each
 policy is evaluated for command fidelity, periodicity, energetic cost and
 robustness across the full commanded range. A duty-factor selector network,
-fit on success under disturbance, chooses the duty factor for every speed,
-period and stance width.
+fit on success under disturbance, chooses the duty factor for each speed, period
+and stance width where some duty factor is robust enough to label.
 
 ## Commanded domain
 
@@ -43,7 +43,7 @@ swing ticks. Commands change only at gait-cycle boundaries.
 | 8 | Export | shell step | per-trial CSVs, robustness summaries, policy provenance, duty-contrast report, selector fit, validation and promotion, and the paper figures into `paper_data/` |
 
 Trainings run one at a time. Stages 2 and 5 run trot and walk side by side, and
-the runs of stage 4 and of the selector validation share two workers. Each
+the runs of stage 4 and of the selector validation share three workers. Each
 evaluation is an independent process with its own seeds, so this changes only
 wall-clock time.
 
@@ -55,7 +55,7 @@ wall-clock time.
 | 2 | Positive mechanical CoT against realized duty factor, trot and walk, one panel per stance width |
 | 3 | Robustness: success rate against stance width at 0.30 m/s, one line per commanded duty factor, per gait |
 | 4 | Realized duty factor by stance width and commanded duty factor, per gait |
-| 5 | Duty factor chosen by the selector network against stance width, trot and walk: mean and interquartile range over the network's speed and period contexts |
+| 5 | Duty factor chosen by the selector network against stance width, trot and walk: mean, interquartile range and full range over the network's speed and period contexts |
 
 Every figure pools the periods at which every duty factor of the gait was run.
 CoT uses every trial that completed without a failure and with a finite positive
@@ -89,10 +89,11 @@ Random world-frame base force up to 25 N and torque up to 3 N m, held
 ### Selector network
 
 **Labels.** A context is a gait, speed, period and stance width of the stage 4
-runs. Its label is the lowest duty factor whose success rate under disturbance
-is at least 90% of the best success rate any duty factor reaches in that
-context. A context where no duty factor succeeds has no label, and the selector
-abstains there. Each label carries a 95% interval from 100,000 binomial
+runs, which must cover the full grid. Its label is the lowest duty factor whose
+success rate under disturbance is at least 90% of the best success rate any duty
+factor reaches in that context. A context whose best success rate is below 5%
+has no label, so a label never rests on one or two successful trials, and the
+selector abstains there. Each label carries a 95% interval from 100,000 binomial
 resamples of the context's trials.
 
 **Network.** A classifier over the evaluated duty factors with inputs stance
@@ -101,10 +102,12 @@ is masked to the gait's duty factors that are feasible at the period, and it
 must reproduce every label exactly.
 
 **Validation.** Every selection is run again under the same disturbances on the
-held-out test split, 64 trials per context. A context fails when its fresh
-success rate is significantly below 90% of the best success rate in its
-labelling runs: one-sided exact binomial test at a family-wise 5%, Bonferroni
-corrected over contexts. The selector is promoted when no context fails.
+held-out test split, 64 trials per context. The required rate is 90% of the
+best success rate of the context's labelling runs. One-sided exact tests look
+for fresh success significantly below that rate, once per context and once per
+gait and stance width over all of its contexts, which keeps power where success
+rates are low; together they are Bonferroni corrected to a family-wise 5%. The
+selector is promoted when no test finds a significant shortfall.
 
 Taking the lowest duty factor that keeps nearly all of the achievable robustness
 selects the least conservative gait that is still robust. The share is taken of
@@ -163,7 +166,7 @@ not enter the selection.
 | `results/narrow_surfaces_sweep_<gait>_<tag>/grid/` | period-sweep archives and `surface_trials.csv` |
 | `results/narrow_robust_selector_<tag>/` | selector fit: success of every candidate, labels with intervals, contexts without success, predictions, checkpoint |
 | `results/narrow_robust_selector_validation_<gait>_v<speed>_p<period>_<tag>/` | fresh-seed disturbance runs of the selections |
-| `results/narrow_robust_selector_promoted_<tag>/` | per-context validation summary, report, validated checkpoint |
+| `results/narrow_robust_selector_promoted_<tag>/` | per-context and per-gait-and-width validation summaries, report, validated checkpoint |
 | `PAPER_GRAPHS/narrow_specialist/paper_figures/` | the five paper figures with their tables |
 | `paper_data/specialist_<tag>/` | shareable export: per-trial CSVs, robustness summaries (`trials/robustness_<gait>_v<speed>_p<period>.json`), selector validation runs (`trials/selector_validation_<gait>_v<speed>_p<period>.json`), `selector_fit/`, `selector_promoted/`, policy provenance, duty-contrast report, paper figures |
 | `results/<tag>.status` | one line per finished stage |
@@ -184,8 +187,8 @@ tail -f results/narrow_20260914.status
 ```
 
 Set `TAG` to start a separate run, `PYTHON_BIN` if the Isaac Lab Python is
-elsewhere, and `REPO_ROOT` when running a copy of the script from another
-directory. The script is resumable: completed stages are skipped, and a
+elsewhere, `WORKERS` for the number of parallel evaluation workers (3), and
+`REPO_ROOT` when running a copy of the script from another directory. The script is resumable: completed stages are skipped, and a
 training stage without its final checkpoint is retrained from the start. A new
 selector fit discards the previous selector validation runs.
 

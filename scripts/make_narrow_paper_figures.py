@@ -9,9 +9,9 @@
      disturbance level
   4  realized duty factor by stance width and commanded duty factor, trot and
      walk panels
-  5  the duty-factor selector network's choice against stance width: mean and
-     interquartile range over its speed and period contexts, trot and walk on one
-     axis
+  5  the duty-factor selector network's choice against stance width: mean,
+     interquartile range and full range over its speed and period contexts, trot
+     and walk on one axis
 
 Every figure pools the periods at which every duty factor of the gait was run, so
 each duty factor averages the same periods (trot 0.75 needs 0.40 s or longer).
@@ -299,8 +299,8 @@ def figure_realized_duty(results, tag, out):
 
 def figure_selector(results, tag, out):
     """The selector network's duty factor for each of its speed and period contexts against stance
-    width, per gait, over the periods at which every duty factor ran: mean and interquartile range
-    of the contexts at each width. Widths where no context has any success have no selection."""
+    width, per gait, over the periods at which every duty factor ran: mean, interquartile range and
+    full range of the contexts at each width. Widths where no context is labelled have no point."""
     fit = results / f"narrow_robust_selector_{tag}"
     predictions = list(csv.DictReader((fit / "selector_predictions.csv").open()))
     candidates = list(csv.DictReader((fit / "candidate_success.csv").open()))
@@ -324,15 +324,17 @@ def figure_selector(results, tag, out):
             chosen = sorted(float(r["selected_df"]) for r in at(predictions, w))
             if chosen:
                 q25, q75 = (float(q) for q in np.quantile(chosen, [.25, .75], method="inverted_cdf"))
-                curves[gait][w] = (float(np.mean(chosen)), q25, q75)
+                curves[gait][w] = (float(np.mean(chosen)), q25, q75, chosen[0], chosen[-1])
             else:
-                curves[gait][w] = (None, None, None)
-            mean, q25, q75 = curves[gait][w]
+                curves[gait][w] = (None,) * 5
+            mean, q25, q75, low, high = curves[gait][w]
             table.append({"gait": gait, "step_width": w, "contexts": len(chosen),
-                          "contexts_without_success": len(at(rejected, w)),
+                          "contexts_without_label": len(at(rejected, w)),
                           "selected_df_mean": "" if mean is None else mean,
                           "selected_df_q25": "" if q25 is None else q25,
                           "selected_df_q75": "" if q75 is None else q75,
+                          "selected_df_min": "" if low is None else low,
+                          "selected_df_max": "" if high is None else high,
                           "selections": " ".join(f"{d:g}x{chosen.count(d)}" for d in sorted(set(chosen))),
                           "speeds": " ".join(f"{v:g}" for v in speeds),
                           "periods": " ".join(f"{p:g}" for p in keep),
@@ -340,18 +342,20 @@ def figure_selector(results, tag, out):
     if not table:
         raise FileNotFoundError("no selector fit")
     tested = sorted({round(float(r["command_df"]), 3) for r in candidates})
-    ceiling = tested[-1] + .07      # widths where no duty factor succeeds sit above the highest duty factor
+    ceiling = tested[-1] + .07      # widths where no context is labelled sit above the highest duty factor
     fig, ax = plt.subplots(figsize=(4.8, 3.6))
     for j, (gait, points) in enumerate(curves.items()):
         shift = (j - (len(curves) - 1) / 2) * .008
-        found = [(w + shift, c, lo, hi) for w, (c, lo, hi) in sorted(points.items()) if c is not None]
-        ax.vlines([x for x, *_ in found], [lo for _, _, lo, _ in found], [hi for *_, hi in found],
-                  color=GAIT_COLORS[gait], lw=.8)
-        ax.plot([x for x, *_ in found], [c for _, c, _, _ in found], color=GAIT_COLORS[gait], lw=2, marker="o",
+        found = [(w + shift, *values) for w, values in sorted(points.items()) if values[0] is not None]
+        x = [row[0] for row in found]
+        # full range of the contexts behind, interquartile range in front
+        ax.vlines(x, [row[4] for row in found], [row[5] for row in found], color=GAIT_COLORS[gait], lw=.8, alpha=.35)
+        ax.vlines(x, [row[2] for row in found], [row[3] for row in found], color=GAIT_COLORS[gait], lw=1.8)
+        ax.plot(x, [row[1] for row in found], color=GAIT_COLORS[gait], lw=2, marker="o",
                 ms=5, label=gait.capitalize())
-        none = [w + shift for w, (c, _, _) in sorted(points.items()) if c is None]
+        none = [w + shift for w, values in sorted(points.items()) if values[0] is None]
         ax.plot(none, [ceiling] * len(none), ls="none", marker="x", ms=6, mew=1.6, color=GAIT_COLORS[gait])
-    ax.plot([], [], ls="none", marker="x", ms=6, mew=1.6, color=MUTED, label="no duty factor succeeds")
+    ax.plot([], [], ls="none", marker="x", ms=6, mew=1.6, color=MUTED, label="no duty factor reaches 5% success")
     widths = sorted({t["step_width"] for t in table})
     ax.set_xticks(widths, [f"{w:.2f}" for w in widths])
     ax.set_yticks(tested, [f"{d:g}" for d in tested])

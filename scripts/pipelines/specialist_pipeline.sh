@@ -80,10 +80,12 @@ attempt() { # completion-file stage-name command...
   done
   return 1
 }
-# Run job lines from stdin (each a function call) on two workers. A worker claims
-# a job by creating its lock directory, so every job runs once.
+# Run job lines from stdin (each a function call) on $WORKERS workers. A worker
+# claims a job by creating its lock directory, so every job runs once. Each start
+# still waits for the memory the evaluation check needs.
+WORKERS=${WORKERS:-3}
 pool() { # name
-  local locks=results/.pool_${TAG}_$1 jobs a b
+  local locks=results/.pool_${TAG}_$1 jobs pids=() n
   jobs=$(cat)
   [ -z "$jobs" ] && return 0
   rm -rf "$locks"; mkdir -p "$locks"
@@ -93,10 +95,11 @@ pool() { # name
       mkdir "$locks/$i" 2>/dev/null || continue
       eval "$line" < /dev/null   # a job must not read the remaining job lines
     done <<< "$jobs"; }
-  worker & a=$!
-  sleep 45
-  worker & b=$!
-  wait $a $b
+  for n in $(seq $WORKERS); do
+    worker & pids+=($!)
+    [ $n -lt $WORKERS ] && sleep 45
+  done
+  wait "${pids[@]}"
   rm -rf "$locks"; }
 
 # 2. Command fidelity at every period.
@@ -122,8 +125,8 @@ run fidelity_gate $P scripts/narrow_fidelity_gate.py --criterion contrast --runs
   --output results/${TAG}_fidelity_gate.json
 
 # 4. Robustness: success under random base disturbances at every speed, period,
-#    width and duty factor, on two workers. The selector's labels come from
-#    these runs; figure 3 uses 0.30 m/s.
+#    width and duty factor, on the evaluation workers. The selector's labels come
+#    from these runs; figure 3 uses 0.30 m/s.
 push_dir() { # gait speed period force
   local level=""; [ "$4" != 25 ] && level="_f$4"
   printf "results/push_robustness_narrow_%s_v%s_p%.2f%s_%s" "$1" "$(v3 $2)" "$3" "$level" "$TAG"; }
@@ -172,7 +175,9 @@ FIT=results/narrow_robust_selector_${TAG}
 PROMOTED_DIR=results/narrow_robust_selector_promoted_${TAG}
 if [ ! -f $FIT/robust_duty_selector.pt ]; then
   rm -rf $FIT $PROMOTED_DIR results/narrow_robust_selector_validation_*_${TAG}
-  run selector_fit $P scripts/fit_robust_duty_selector.py --tag $TAG --output $FIT
+  run selector_fit $P scripts/fit_robust_duty_selector.py --tag $TAG --output $FIT --speeds $SPEEDS --widths $W \
+    --periods trot=$(periods_of trot | tr ' ' ,) walk=$(periods_of walk | tr ' ' ,) \
+    --duties trot=$(dfs_of trot .48 | tr ' ' ,) walk=$(dfs_of walk .48 | tr ' ' ,)
 fi
 if [ -f $FIT/robust_duty_selector.pt ]; then
   selector_validation_job() { # gait speed period widths duties (comma-separated)
